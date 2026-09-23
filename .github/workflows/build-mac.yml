@@ -1,0 +1,62 @@
+# GitHub 의 클라우드 맥에서 RingTimer.app 을 만들고 점검하는 설정
+name: Build Mac App
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest        # M1 이후 (애플 실리콘) 맥
+            arch: AppleSilicon
+          - os: macos-15-intel      # 인텔 맥
+            arch: Intel
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install --upgrade pillow pyinstaller
+
+      - name: Self-test (source)
+        run: python ring_timer.py --selftest
+
+      - name: Icon
+        run: python ring_timer.py --make-icon-png
+
+      - name: Build app
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed
+          --name RingTimer --icon ring_timer_icon.png
+          --osx-bundle-identifier com.ringtimer.app ring_timer.py
+
+      - name: Self-test (built app)
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          r = subprocess.run(["dist/RingTimer.app/Contents/MacOS/RingTimer", "--selftest"], timeout=180)
+          print("exit code:", r.returncode)
+          sys.exit(r.returncode)
+          PY
+
+      - name: Package zip
+        run: |
+          mkdir RingTimer
+          cp -R dist/RingTimer.app RingTimer/
+          cp RingTimer설명서.txt RingTimer/ || true
+          cp 맥_처음실행방법.txt RingTimer/ || true
+          ditto -c -k --sequesterRsrc --keepParent RingTimer RingTimer-mac-${{ matrix.arch }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RingTimer-mac-${{ matrix.arch }}
+          path: RingTimer-mac-${{ matrix.arch }}.zip
