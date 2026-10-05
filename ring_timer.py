@@ -31,6 +31,8 @@ IS_MAC = sys.platform == "darwin"
 SUPERSAMPLE = 3          # 원을 크게 그린 뒤 줄여서 테두리를 부드럽게
 RING_THICKNESS = 0.105   # 원 두께 (지름 대비 비율)
 FADE_MS = 280            # 라이트/다크 전환 페이드 시간 (밀리초)
+PULSE_SEC = 2.0          # 무한 모드에서 원이 한 번 흐려졌다 돌아오는 시간 (초)
+PULSE_LOW = 0.15         # 가장 흐려질 때 남는 원 색 비율
 PLACEHOLDERS = ("HH", "MM", "SS")
 ICON_GRAY = "#8E8E96"    # 실행 파일(exe) 아이콘 색
 
@@ -64,6 +66,9 @@ DEFAULT_SETTINGS = {
     "sound_gray": "",          # 휴식 알림음: 루틴 휴식(회색) 구간 시작
     "sound_dir": "",           # 알림음 파일을 마지막으로 고른 폴더
     "geometry": "",
+    "infinite": False,         # 무한 모드 (0부터 위로 세는 스톱워치)
+    "mini": False,             # 미니 모드 (원 + 시간만, 정사각형 창)
+    "mini_geometry": "",
 }
 
 
@@ -185,6 +190,24 @@ def render_ring(size, frac, track, color, bg, ss=SUPERSAMPLE):
     return img.resize((size, size), Image.LANCZOS)
 
 
+_RING_MASKS = {}
+
+
+def render_full_ring(size, color, bg, ss=SUPERSAMPLE):
+    """꽉 찬 원 (무한 모드 깜빡임용). 모양은 크기별로 한 번만 그리고 색만 칠함"""
+    if size not in _RING_MASKS:
+        if len(_RING_MASKS) > 4:
+            _RING_MASKS.clear()
+        S = size * ss
+        m = Image.new("L", (S, S), 0)
+        w, mm = max(2, int(S * RING_THICKNESS)), ss * 2
+        ImageDraw.Draw(m).ellipse([mm, mm, S - mm, S - mm], outline=255, width=w)
+        _RING_MASKS[size] = m.resize((size, size), Image.LANCZOS)
+    img = Image.new("RGB", (size, size), bg)
+    img.paste(color, (0, 0), _RING_MASKS[size])
+    return img
+
+
 def render_disc(d, color, bg):
     """가운데 옅은 원 (원 영역이 버튼이라는 표시)"""
     k = 3
@@ -258,6 +281,24 @@ def render_icon(kind, size, fg, bg, circle=None):
         L, w = 17 * u, int(6 * u)
         d.line([c - L, c, c + L, c], fill=fg, width=w)
         d.line([c, c - L, c, c + L], fill=fg, width=w)
+    elif kind in ("mini", "expand"):
+        # 네 귀퉁이 꺾쇠: mini = 안쪽을 향함(줄이기), expand = 바깥을 향함(늘리기)
+        w = int(5 * u)
+        a, b = (5 * u, 17 * u) if kind == "mini" else (19 * u, 8 * u)   # 꼭짓점 거리, 팔 끝 거리
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                vx, vy = c + sx * a, c + sy * a
+                d.line([vx, vy, c + sx * b, vy], fill=fg, width=w)
+                d.line([vx, vy, vx, c + sy * b], fill=fg, width=w)
+                d.ellipse([vx - w / 2, vy - w / 2, vx + w / 2, vy + w / 2], fill=fg)
+    elif kind == "infinite":
+        a, w = 27 * u, int(6 * u)
+        pts = []
+        for i in range(121):
+            t = 2 * math.pi * i / 120
+            k = 1 + math.sin(t) ** 2
+            pts.append((c + a * math.cos(t) / k, c + a * math.sin(t) * math.cos(t) / k * 1.15))
+        d.line(pts, fill=fg, width=w, joint="curve")
     elif kind == "pin":
         img.paste(fg, (0, 0), _pin_mask(S))
     return img.resize((size, size), Image.LANCZOS)
@@ -1497,6 +1538,12 @@ class RingTimerApp:
         self._fade_job = None
         self._fading = False
         self.colors = dict(THEMES[self.cfg["theme"]])
+        self.infinite = bool(self.cfg.get("infinite"))
+        self.elapsed = 0.0           # 무한 모드에서 센 시간
+        self.start_mono = 0.0
+        self.mini = False
+        self._mini_side = 0
+        self._square_job = None
 
         families = set(tkfont.families(root))
         self.ui_family = next((f for f in ("Malgun Gothic", "맑은 고딕", "Segoe UI", "Apple SD Gothic Neo",
@@ -1521,7 +1568,7 @@ class RingTimerApp:
 
         self._build_ui()
         self.apply_theme()
-        self._set_entries(self.duration)
+        self._set_entries(0 if self.infinite else self.duration)   # 무한 모드에선 입력칸을 비워 둠
         if self.interval_active():
             self._load_segment(0)
         self._update_controls()
@@ -1532,6 +1579,8 @@ class RingTimerApp:
         root.geometry(geo if re.fullmatch(r"\d+x\d+[+-]-?\d+[+-]-?\d+", geo) else f"{self.px(380)}x{self.px(540)}")
         root.attributes("-topmost", bool(self.cfg.get("topmost")))
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.cfg.get("mini"):
+            self.set_mini(True, startup=True)
 
         try:
             self._icon_key = None
@@ -1543,6 +1592,7 @@ class RingTimerApp:
         root.bind("<space>", self._key_toggle)
         root.bind("<KeyPress-r>", self._key_reset)
         root.bind("<KeyPress-R>", self._key_reset)
+        root.bind("<Escape>", lambda e: self.set_mini(False))
         self._tick()
         self._chip_poll()
 
@@ -1556,16 +1606,21 @@ class RingTimerApp:
 
         # 맨 위: 테마 아이콘(왼쪽) / 항상 위 아이콘(오른쪽)
         self.row_top = tk.Frame(r)
-        self.row_top.pack(fill="x", padx=self.px(10), pady=(self.px(8), 0))
         self.btn_theme = IconButton(self.row_top, self.toggle_theme)
         self.btn_theme.pack(side="left")
+        self.btn_inf = IconButton(self.row_top, lambda: self.set_infinite(not self.infinite))
+        self.btn_inf.pack(side="left")
         self.btn_pin = IconButton(self.row_top, self.toggle_topmost)
         self.btn_pin.pack(side="right")
+        self.btn_mini = IconButton(self.row_top, lambda: self.set_mini(True))
+        self.btn_mini.pack(side="right")
         self.lbl_total = tk.Label(self.row_top, text="", font=self.f_total)
         self.lbl_total.place(relx=0.5, rely=0.5, anchor="center")
 
         self.canvas = tk.Canvas(r, highlightthickness=0, bd=0, cursor="arrow")
         self.canvas.pack(fill="both", expand=True, padx=pad, pady=(self.px(2), self.px(4)))
+        # 미니 모드에서 창에 마우스를 올리면 오른쪽 위에 나타나는 '원래 크기로' 버튼
+        self.btn_restore = IconButton(r, lambda: self.set_mini(False))
         self.ring_item = self.canvas.create_image(0, 0, anchor="center")
         self.disc_item = self.canvas.create_image(0, 0, anchor="center", state="hidden")   # 마우스 올리면 옅은 원
         self._hover_alpha = 0.0
@@ -1586,7 +1641,6 @@ class RingTimerApp:
 
         # 시간 입력  HH : MM : SS (루틴과 같은 방식: 숫자를 칸 그림에 직접 그림)
         self.row_input = tk.Frame(r)
-        self.row_input.pack(pady=(self.px(8), 0))
         self.tf = TimeFields(self.row_input, self, PLACEHOLDERS, self.px(66), self.px(50), self.f_input,
                              on_change=self._apply_fields, on_enter=self._on_enter,
                              focus_color=self.ring_color)
@@ -1595,12 +1649,9 @@ class RingTimerApp:
 
         # 재생/일시정지 (가운데) + 리셋 (왼쪽)
         self.row_ctrl = tk.Frame(r)
-        self.row_input.pack_forget()
-        self.row_input.pack(side="bottom", pady=(self.px(14), self.px(34)), before=self.canvas)
         self.flex_gap = tk.Frame(r, height=1)                   # 창을 늘리면 벌어지는 여백 (버튼 ↔ 입력칸)
         self.flex_gap.pack_propagate(False)
-        self.flex_gap.pack(side="bottom", fill="x", before=self.canvas)
-        self.row_ctrl.pack(side="bottom", pady=(self.px(6), 0), before=self.canvas)
+        self._pack_rows()
         self.btn_reset = IconButton(self.row_ctrl, self.reset)
         self.btn_reset.grid(row=0, column=0, padx=self.px(14))
         self.btn_play = IconButton(self.row_ctrl, self.toggle)
@@ -1617,6 +1668,70 @@ class RingTimerApp:
         self._panel_size = (self.px(100), self.px(40))
         self._chip_alpha = 0.0
         self._rebuild_dots()
+
+    def _pack_rows(self):
+        """원 둘레의 줄들(위 아이콘 / 버튼 / 입력칸)을 원래 자리에 배치"""
+        c = self.canvas
+        self.row_top.pack(fill="x", padx=self.px(10), pady=(self.px(8), 0), before=c)
+        self.row_input.pack(side="bottom", pady=(self.px(14), self.px(34)), before=c)
+        self.flex_gap.pack(side="bottom", fill="x", before=c)
+        self.row_ctrl.pack(side="bottom", pady=(self.px(6), 0), before=c)
+
+    # ── 미니 모드 ──
+    def set_mini(self, on, startup=False):
+        """미니 모드: 원 + 시간만 보이는 정사각형 창"""
+        if on == self.mini:
+            return
+        r = self.root
+        r.update_idletasks()
+        geo_re = r"(\d+)x(\d+)([+-]-?\d+[+-]-?\d+)"
+        m = re.fullmatch(geo_re, r.geometry())
+        pos = m.group(3) if m else ""
+        self.mini = on
+        if on:
+            if not startup:
+                self.cfg["geometry"] = r.geometry()
+            p = self.interval_panel
+            if p is not None and p.is_shown():
+                p.withdraw()
+            self._chip_alpha = 0.0
+            self.chip_panel.place_forget()
+            for w in (self.row_top, self.row_input, self.flex_gap, self.row_ctrl):
+                w.pack_forget()
+            self.canvas.pack_configure(padx=self.px(10), pady=self.px(10))
+            r.minsize(self.px(150), self.px(150))
+            mg = re.fullmatch(geo_re, self.cfg.get("mini_geometry") or "")
+            side = int(mg.group(1)) if mg else self.px(240)
+            if startup and mg:
+                pos = mg.group(3)
+            self._mini_side = side
+            r.geometry(f"{side}x{side}{pos}")
+        else:
+            self.cfg["mini_geometry"] = r.geometry()
+            self.btn_restore._set_hover(False)
+            self.btn_restore.place_forget()
+            self.canvas.pack_configure(padx=self.px(16), pady=(self.px(2), self.px(4)))
+            self._pack_rows()
+            r.minsize(self.px(330), self.px(470))
+            mg = re.fullmatch(geo_re, self.cfg.get("geometry") or "")
+            size = f"{mg.group(1)}x{mg.group(2)}" if mg else f"{self.px(380)}x{self.px(540)}"
+            r.geometry(size + pos)
+        self.cfg["mini"] = on
+        save_settings(self.cfg)
+
+    def _make_square(self):
+        """미니 모드에서 창 크기를 바꾸면 정사각형으로 맞춤"""
+        self._square_job = None
+        r = self.root
+        if not self.mini or r.state() == "zoomed":
+            return
+        w, h = r.winfo_width(), r.winfo_height()
+        if w != h:
+            side = w if w != self._mini_side else h          # 바뀐 쪽 길이에 맞춤
+            m = re.search(r"[+-]-?\d+[+-]-?\d+$", r.geometry())
+            r.geometry(f"{side}x{side}{m.group(0) if m else ''}")
+            w = side
+        self._mini_side = w
 
     # ── 테마 ──
     def apply_theme(self, colors=None, titlebar=True):
@@ -1640,6 +1755,11 @@ class RingTimerApp:
         self.btn_theme.set_images(render_icon(kind, s, t["sub"], bg),
                                   render_icon(kind, s, t["text"], bg, circle=t["btn"]), bg)
         self._update_pin_icon()
+        self.btn_mini.set_images(render_icon("mini", s, t["sub"], bg),
+                                 render_icon("mini", s, t["text"], bg, circle=t["btn"]), bg)
+        s = self.px(30)
+        self.btn_restore.set_images(render_icon("expand", s, t["sub"], bg, circle=t["btn"]),
+                                    render_icon("expand", s, t["text"], bg, circle=t["btn_hover"]), bg)
         s = self.px(44)
         self.btn_reset.set_images(render_icon("reset", s, t["text"], bg, circle=t["btn"]),
                                   render_icon("reset", s, t["text"], bg, circle=t["btn_hover"]), bg)
@@ -1659,10 +1779,11 @@ class RingTimerApp:
         t = self.colors
         bg = t["bg"]
         s = self.px(34)
-        on = bool(self.cfg.get("topmost"))
-        fg = self.cfg["accent"] if on else t["sub"]
-        self.btn_pin.set_images(render_icon("pin", s, fg, bg),
-                                render_icon("pin", s, fg if on else t["text"], bg, circle=t["btn"]), bg)
+        for btn, kind, on in ((self.btn_pin, "pin", bool(self.cfg.get("topmost"))),
+                              (self.btn_inf, "infinite", self.infinite)):
+            fg = self.cfg["accent"] if on else t["sub"]
+            btn.set_images(render_icon(kind, s, fg, bg),
+                           render_icon(kind, s, fg if on else t["text"], bg, circle=t["btn"]), bg)
 
     def palette(self):
         return [c.upper() for c in PRESET_COLORS] + self.cfg["custom_colors"]
@@ -1738,6 +1859,15 @@ class RingTimerApp:
             x, y = r.winfo_pointerxy()
             rx, ry, w, h = r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height()
             in_window = rx <= x < rx + w and ry <= y < ry + h
+            if self.mini:                     # 미니 모드: 컬러칩 대신 '원래 크기로' 버튼만
+                shown = self.btn_restore.winfo_ismapped()
+                if in_window and not shown:
+                    self.btn_restore.place(relx=1.0, x=-self.px(6), y=self.px(6), anchor="ne")
+                    self.btn_restore.lift()
+                elif not in_window and shown:
+                    self.btn_restore.place_forget()
+                self.root.after(35, self._chip_poll)
+                return
             boxes_bottom = ry + self.row_input.winfo_y() + self.row_input.winfo_height()
             boxes_mid = ry + self.row_input.winfo_y() + self.row_input.winfo_height() // 2
             # 입력칸 아래 절반 ~ 창 맨 아래, 또는 창 맨 아래 띠에 마우스가 오면 표시
@@ -1957,7 +2087,32 @@ class RingTimerApp:
 
     # ── 인터벌 ──
     def interval_active(self):
-        return bool(self.cfg.get("interval_on")) and len(self.intervals) > 0
+        return not self.infinite and bool(self.cfg.get("interval_on")) and len(self.intervals) > 0
+
+    # ── 무한 모드 ──
+    def set_infinite(self, on):
+        """무한 모드: 0부터 위로 세는 스톱워치. 원은 꽉 찬 채로 깜빡임"""
+        stop_sound_file()
+        self.infinite = bool(on)
+        self.cfg["infinite"] = self.infinite
+        save_settings(self.cfg)
+        self.running = False
+        self.finished = False
+        self._blink_left = 0
+        self.elapsed = 0.0
+        if self.infinite:
+            self._set_entries(0)
+        else:                                          # 원래 타이머(또는 루틴)로 돌아감
+            if self.interval_active():
+                self._load_segment(0)
+            else:
+                self.duration = max(0, int(self.cfg["duration"]))
+                self._set_entries(self.duration)
+                self.remaining = float(self.duration)
+        self._update_pin_icon()
+        self._update_controls()
+        self._refresh_interval_ui()
+        self.redraw(force=True)
 
     def side_anchor(self):
         """옆에 붙일 기준 창 (인터벌 패널이 열려 있으면 그 옆)"""
@@ -2056,6 +2211,8 @@ class RingTimerApp:
     def _balance_gap(self):
         """남는 세로 공간을 '원 위'와 '버튼 ↔ 입력칸 사이'에 반씩 나눔"""
         self._gap_pending = False
+        if self.mini:
+            return
         try:
             total = self.canvas.winfo_height() + self.flex_gap.winfo_height()
             ring = min(self.canvas.winfo_width(), total)
@@ -2068,6 +2225,10 @@ class RingTimerApp:
     def _on_root_configure(self, e):
         if e.widget is not self.root:
             return
+        if self.mini:
+            if self._square_job:
+                self.root.after_cancel(self._square_job)
+            self._square_job = self.root.after(250, self._make_square)
         self._request_gap()
 
     def _request_gap(self):
@@ -2099,7 +2260,7 @@ class RingTimerApp:
 
     def _apply_fields(self):
         """입력 칸 값을 타이머 시간으로 반영 (실행 중이 아닐 때만)"""
-        if self.running or self.interval_active():
+        if self.running or self.interval_active() or self.infinite:
             return
         h, m, s = self._field_values()
         total = h * 3600 + m * 60 + s
@@ -2125,6 +2286,12 @@ class RingTimerApp:
 
     def start(self):
         if self.running:
+            return
+        if self.infinite:                              # 무한 모드: 멈춘 곳부터 이어서 셈
+            self.start_mono = time.monotonic() - self.elapsed
+            self.running = True
+            self._update_controls()
+            self.redraw(force=True)
             return
         if self.duration <= 0 and not self.interval_active():   # 시간을 아직 안 넣었으면 시작 안 함
             if self.tf.active is None:
@@ -2153,7 +2320,10 @@ class RingTimerApp:
     def pause(self):
         if not self.running:
             return
-        self.remaining = max(0.0, self.end_time - time.monotonic())
+        if self.infinite:
+            self.elapsed = time.monotonic() - self.start_mono
+        else:
+            self.remaining = max(0.0, self.end_time - time.monotonic())
         self.running = False
         self._update_controls()
         self.redraw(force=True)
@@ -2173,6 +2343,7 @@ class RingTimerApp:
         self.finished = False
         self._blink_left = 0
         self.remaining = float(self.duration)
+        self.elapsed = 0.0
         self._update_controls()
         self.redraw(force=True)
 
@@ -2232,7 +2403,7 @@ class RingTimerApp:
         s = self.px(60)
         self.btn_play.set_images(render_icon(kind, s, fg, t["bg"], circle=accent),
                                  render_icon(kind, s, fg, t["bg"], circle=hover), t["bg"])
-        self.tf.set_locked(self.running or self.interval_active())   # 도는 중 / 루틴 사용 중엔 입력 잠금
+        self.tf.set_locked(self.running or self.interval_active() or self.infinite)   # 도는 중 / 루틴·무한 모드엔 입력 잠금
         p = self.interval_panel
         if p is not None and p.winfo_exists():
             p.set_locked(self.running)                                  # 재생 중엔 루틴 편집 잠금
@@ -2247,7 +2418,10 @@ class RingTimerApp:
                                      render_icon("menu", s, t["text"], t["bg"], circle=t["btn_hover"]), t["bg"])
 
     def _tick(self):
-        if self.running:
+        if self.running and self.infinite:
+            self.elapsed = time.monotonic() - self.start_mono
+            self.redraw()
+        elif self.running:
             self.remaining = max(0.0, self.end_time - time.monotonic())
             if self.remaining <= 0:
                 self.finish()
@@ -2336,7 +2510,7 @@ class RingTimerApp:
         self._adjust_minutes(1 if e.delta > 0 else -1)
 
     def _adjust_minutes(self, step):
-        if self.interval_active() or self.running or (0 < self.remaining < self.duration and not self.finished):
+        if self.infinite or self.interval_active() or self.running or (0 < self.remaining < self.duration and not self.finished):
             return
         self.set_duration(max(60, min(99 * 3600, (self.duration // 60 + step) * 60)))
 
@@ -2360,25 +2534,34 @@ class RingTimerApp:
         t = self.colors
         accent = self.ring_color()
         size = max(60, min(w, h))
-        cx, cy = w / 2, h - size / 2          # 원을 캔버스 아래(버튼 쪽)에 붙임
+        cx, cy = w / 2, (h / 2 if self.mini else h - size / 2)   # 평소엔 원을 캔버스 아래(버튼 쪽)에 붙임
 
         frac = (self.remaining / self.duration) if self.duration > 0 else 1.0   # 공란이면 꽉 찬 원
         if self.finished:
             frac = 1.0 if self.blink_on else 0.0
+        shown = self.remaining
+        pulse = 1.0
+        if self.infinite:                     # 무한 모드: 꽉 찬 원이 도는 동안 천천히 흐려졌다 돌아옴
+            frac, shown = 1.0, self.elapsed
+            if self.running:
+                k = math.cos(math.pi * self.elapsed / PULSE_SEC) ** 2      # 1 → 0 → 1 (ease-in-out)
+                pulse = round(PULSE_LOW + (1 - PULSE_LOW) * k, 2)
 
-        key = (size, round(frac * 1440), t["bg"], t["track"], accent)
+        key = (size, round(frac * 1440), pulse, t["bg"], t["track"], accent)
         if force or key != self._ring_key:
             self._ring_key = key
             fi = getattr(self, "_fade_imgs", None)
             if self._fading and fi and fi[0] == size:
                 img = Image.blend(fi[1], fi[2], self._fade_k)      # 미리 그린 두 장을 섞음
+            elif self.infinite:
+                img = render_full_ring(size, mix(t["track"], accent, pulse), t["bg"])
             else:
                 img = render_ring(size, frac, t["track"], accent, t["bg"])
             self._ring_photo = ImageTk.PhotoImage(img)
             c.itemconfigure(self.ring_item, image=self._ring_photo)
             c.coords(self.ring_item, cx, cy)
 
-        time_txt = format_time(self.remaining, floor=True)
+        time_txt = format_time(shown, floor=True)
         ratio = 0.19 if len(time_txt) <= 5 else 0.145
         new_size = -max(12, int(size * ratio))
         if self.f_time.cget("size") != new_size:
@@ -2392,9 +2575,11 @@ class RingTimerApp:
         pct = int(math.floor(((self.remaining / self.duration) if self.duration else 0) * 100 + 1e-9))
         c.itemconfigure(self.pct_item, text="")
 
-        cs = int((max(0.0, self.remaining) % 1) * 100 + 1e-6) % 100        # 1/100 초
+        cs = int((max(0.0, shown) % 1) * 100 + 1e-6) % 100        # 1/100 초
         c.itemconfigure(self.total_item, text=f".{cs:02d}")
-        if self.interval_active():
+        if self.infinite:
+            top = "∞"
+        elif self.interval_active():
             name, secs, _, _ = self.intervals[self.seg_idx]
             top = f"{self.seg_idx + 1}/{len(self.intervals)} · {name or format_time(secs)}"
         else:
@@ -2408,7 +2593,7 @@ class RingTimerApp:
 
     def on_close(self):
         try:
-            self.cfg["geometry"] = self.root.geometry()
+            self.cfg["mini_geometry" if self.mini else "geometry"] = self.root.geometry()
         except Exception:
             pass
         save_settings(self.cfg)
@@ -2448,6 +2633,11 @@ def run_selftest():
         lambda: app._picker.destroy(),
         lambda: app.toggle_theme(),
         lambda: app.set_accent("#0091FF"),
+        lambda: app.set_infinite(True),
+        lambda: app.start(),
+        lambda: app.set_mini(True),
+        lambda: app.set_mini(False),
+        lambda: app.set_infinite(False),
     ]
 
     def run(i=0):
