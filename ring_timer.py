@@ -304,6 +304,16 @@ def render_icon(kind, size, fg, bg, circle=None):
     return img.resize((size, size), Image.LANCZOS)
 
 
+def render_round_icon(kind, size, fg, circle):
+    """동그란 버튼 아이콘 (원 바깥은 투명) — 캔버스 위에 겹쳐 그릴 때 사용"""
+    img = render_icon(kind, size, fg, circle, circle=circle).convert("RGBA")
+    S = size * 4
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).ellipse([0, 0, S - 1, S - 1], fill=255)
+    img.putalpha(mask.resize((size, size), Image.LANCZOS))
+    return img
+
+
 _PIN_CACHE = {}
 
 
@@ -1558,7 +1568,7 @@ class RingTimerApp:
         self.f_ui = tkfont.Font(root, family=self.ui_family, size=10)
         self.f_ui_bold = tkfont.Font(root, family=self.ui_family, size=11, weight="bold")
         self.f_small = tkfont.Font(root, family=self.ui_family, size=9)
-        self.f_input = tkfont.Font(root, family=self.num_family, size=18, weight="bold")
+        self.f_input = tkfont.Font(root, family=self.num_family, size=16, weight="bold")
         self.f_row = tkfont.Font(root, family=self.num_family, size=13, weight="bold")
 
         self.intervals = []          # [(이름, 초, 줄 번호, 색)]
@@ -1574,7 +1584,7 @@ class RingTimerApp:
         self._update_controls()
 
         root.title("Ring Timer")
-        root.minsize(self.px(330), self.px(470))
+        root.minsize(self.px(260), self.px(380))
         geo = self.cfg.get("geometry") or ""
         root.geometry(geo if re.fullmatch(r"\d+x\d+[+-]-?\d+[+-]-?\d+", geo) else f"{self.px(380)}x{self.px(540)}")
         root.attributes("-topmost", bool(self.cfg.get("topmost")))
@@ -1619,8 +1629,6 @@ class RingTimerApp:
 
         self.canvas = tk.Canvas(r, highlightthickness=0, bd=0, cursor="arrow")
         self.canvas.pack(fill="both", expand=True, padx=pad, pady=(self.px(2), self.px(4)))
-        # 미니 모드에서 창에 마우스를 올리면 오른쪽 위에 나타나는 '원래 크기로' 버튼
-        self.btn_restore = IconButton(r, lambda: self.set_mini(False))
         self.ring_item = self.canvas.create_image(0, 0, anchor="center")
         self.disc_item = self.canvas.create_image(0, 0, anchor="center", state="hidden")   # 마우스 올리면 옅은 원
         self._hover_alpha = 0.0
@@ -1631,17 +1639,23 @@ class RingTimerApp:
         self.time_item = self.canvas.create_text(0, 0, text="", font=self.f_time, anchor="center")
         self.pct_item = self.canvas.create_text(0, 0, text="", font=self.f_pct, anchor="center")
         self.total_item = self.canvas.create_text(0, 0, text="", font=self.f_small_c, anchor="center")
-        self.canvas.bind("<Configure>", lambda e: (self.redraw(force=True), self._request_gap()))
+        # 미니 모드에서 창에 마우스를 올리면 오른쪽 위에 나타나는 '원래 크기로' 버튼
+        # (원 바깥이 투명해야 링을 사각형으로 가리지 않으므로 캔버스 위에 직접 그림)
+        self.restore_item = self.canvas.create_image(0, 0, anchor="ne", state="hidden")
+        self._restore_photos = (None, None)
+        self._restore_hover = False
+        self.canvas.bind("<Configure>", lambda e: (self.redraw(force=True), self._request_gap(),
+                                                   self._place_restore()))
         self.canvas.bind("<Button-1>", self._on_canvas_click)
         self.canvas.bind("<Motion>", self._on_canvas_motion)
-        self.canvas.bind("<Leave>", lambda e: self._set_ring_hover(False))
+        self.canvas.bind("<Leave>", lambda e: self._on_canvas_leave())
         self.canvas.bind("<MouseWheel>", self._on_wheel)                       # Windows
         self.canvas.bind("<Button-4>", lambda e: self._adjust_minutes(+1))     # Linux
         self.canvas.bind("<Button-5>", lambda e: self._adjust_minutes(-1))
 
         # 시간 입력  HH : MM : SS (루틴과 같은 방식: 숫자를 칸 그림에 직접 그림)
         self.row_input = tk.Frame(r)
-        self.tf = TimeFields(self.row_input, self, PLACEHOLDERS, self.px(66), self.px(50), self.f_input,
+        self.tf = TimeFields(self.row_input, self, PLACEHOLDERS, self.px(58), self.px(44), self.f_input,
                              on_change=self._apply_fields, on_enter=self._on_enter,
                              focus_color=self.ring_color)
         self.tf.pack()
@@ -1708,11 +1722,10 @@ class RingTimerApp:
             r.geometry(f"{side}x{side}{pos}")
         else:
             self.cfg["mini_geometry"] = r.geometry()
-            self.btn_restore._set_hover(False)
-            self.btn_restore.place_forget()
+            self._show_restore(False)
             self.canvas.pack_configure(padx=self.px(16), pady=(self.px(2), self.px(4)))
             self._pack_rows()
-            r.minsize(self.px(330), self.px(470))
+            r.minsize(self.px(260), self.px(380))
             mg = re.fullmatch(geo_re, self.cfg.get("geometry") or "")
             size = f"{mg.group(1)}x{mg.group(2)}" if mg else f"{self.px(380)}x{self.px(540)}"
             r.geometry(size + pos)
@@ -1758,9 +1771,10 @@ class RingTimerApp:
         self.btn_mini.set_images(render_icon("mini", s, t["sub"], bg),
                                  render_icon("mini", s, t["text"], bg, circle=t["btn"]), bg)
         s = self.px(30)
-        self.btn_restore.set_images(render_icon("expand", s, t["sub"], bg, circle=t["btn"]),
-                                    render_icon("expand", s, t["text"], bg, circle=t["btn_hover"]), bg)
-        s = self.px(44)
+        self._restore_photos = (ImageTk.PhotoImage(render_round_icon("expand", s, t["sub"], t["btn"])),
+                                ImageTk.PhotoImage(render_round_icon("expand", s, t["text"], t["btn_hover"])))
+        self._paint_restore()
+        s = self.px(38)
         self.btn_reset.set_images(render_icon("reset", s, t["text"], bg, circle=t["btn"]),
                                   render_icon("reset", s, t["text"], bg, circle=t["btn_hover"]), bg)
         self._update_controls()
@@ -1860,12 +1874,9 @@ class RingTimerApp:
             rx, ry, w, h = r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height()
             in_window = rx <= x < rx + w and ry <= y < ry + h
             if self.mini:                     # 미니 모드: 컬러칩 대신 '원래 크기로' 버튼만
-                shown = self.btn_restore.winfo_ismapped()
-                if in_window and not shown:
-                    self.btn_restore.place(relx=1.0, x=-self.px(6), y=self.px(6), anchor="ne")
-                    self.btn_restore.lift()
-                elif not in_window and shown:
-                    self.btn_restore.place_forget()
+                shown = self.canvas.itemcget(self.restore_item, "state") == "normal"
+                if in_window != shown:
+                    self._show_restore(in_window)
                 self.root.after(35, self._chip_poll)
                 return
             boxes_bottom = ry + self.row_input.winfo_y() + self.row_input.winfo_height()
@@ -2400,14 +2411,14 @@ class RingTimerApp:
             hover = mix(accent, "#000000" if self.cfg["theme"] == "light" else "#FFFFFF", 0.12)
             fg = readable_fg(accent)
         kind = "pause" if self.running else "play"
-        s = self.px(60)
+        s = self.px(52)
         self.btn_play.set_images(render_icon(kind, s, fg, t["bg"], circle=accent),
                                  render_icon(kind, s, fg, t["bg"], circle=hover), t["bg"])
         self.tf.set_locked(self.running or self.interval_active() or self.infinite)   # 도는 중 / 루틴·무한 모드엔 입력 잠금
         p = self.interval_panel
         if p is not None and p.winfo_exists():
             p.set_locked(self.running)                                  # 재생 중엔 루틴 편집 잠금
-        s = self.px(44)
+        s = self.px(38)
         on = self.interval_active()
         opened = self.interval_panel is not None and self.interval_panel.is_shown()
         if on:   # 루틴 사용 중: 재생 버튼처럼 배경 = 지금 원 색
@@ -2464,14 +2475,51 @@ class RingTimerApp:
         cx, cy, size = g
         return (x - cx) ** 2 + (y - cy) ** 2 <= (size / 2) ** 2
 
+    # ── 미니 모드의 '원래 크기로' 버튼 ──
+    def _place_restore(self):
+        self.canvas.coords(self.restore_item, self.canvas.winfo_width(), 0)
+
+    def _paint_restore(self):
+        ph = self._restore_photos[1 if self._restore_hover else 0]
+        if ph is not None:
+            self.canvas.itemconfigure(self.restore_item, image=ph)
+
+    def _show_restore(self, v):
+        if not v:
+            self._restore_hover = False
+            self._paint_restore()
+        else:
+            self._place_restore()
+            self.canvas.tag_raise(self.restore_item)
+        self.canvas.itemconfigure(self.restore_item, state="normal" if v else "hidden")
+
+    def _in_restore(self, x, y):
+        if not self.mini or self.canvas.itemcget(self.restore_item, "state") != "normal":
+            return False
+        x1, y1, x2, y2 = self.canvas.bbox(self.restore_item) or (0, 0, 0, 0)
+        r = (x2 - x1) / 2
+        return r > 0 and (x - (x1 + r)) ** 2 + (y - (y1 + r)) ** 2 <= r * r
+
+    def _on_canvas_leave(self):
+        self._set_ring_hover(False)
+        if self._restore_hover:
+            self._restore_hover = False
+            self._paint_restore()
+
     def _on_canvas_click(self, e):
         self.canvas.focus_set()
-        if self._in_ring(e.x, e.y):
+        if self._in_restore(e.x, e.y):
+            self.set_mini(False)
+        elif self._in_ring(e.x, e.y):
             self.toggle()
 
     def _on_canvas_motion(self, e):
-        inside = self._in_ring(e.x, e.y)
-        self.canvas.configure(cursor="hand2" if inside else "arrow")
+        on_btn = self._in_restore(e.x, e.y)
+        if on_btn != self._restore_hover:
+            self._restore_hover = on_btn
+            self._paint_restore()
+        inside = not on_btn and self._in_ring(e.x, e.y)
+        self.canvas.configure(cursor="hand2" if inside or on_btn else "arrow")
         self._set_ring_hover(inside)
 
     def _set_ring_hover(self, v):

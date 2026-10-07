@@ -1,0 +1,10 @@
+# PyInstaller 빌드 결과물
+build/
+dist/
+*.spec
+ring_timer.ico
+ring_timer_icon.png
+__pycache__/
+
+# 예전 실행 파일 백업
+RingTimer_old.exe
